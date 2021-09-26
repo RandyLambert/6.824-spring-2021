@@ -118,6 +118,7 @@ func (rf *Raft) changeStateNotLock(state int32) {
 		rf.leaderId = rf.me
 
 		lastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
+		//DPrintf("lastLogIndex = %d",lastLogIndex)
 		rf.nextIndex = make([]int, len(rf.peers))
 		for i := 0;i < len(rf.peers);i++ {
 			rf.nextIndex[i] = lastLogIndex + 1
@@ -199,19 +200,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.changeStateNotLock(FollowerState)
 		}
 		rf.heartBeat<-true
-
+		// TODO 不一样
 		// 有 log
 		if len(args.LogEntries) != 0 {
 			// log 匹配成功
-			if args.PrevLogIndex == len(rf.peers) - 1 && args.PrevLogTerm == rf.logEntries[len(rf.peers) - 1].Term {
+			lastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
+			if args.PrevLogIndex == lastLogIndex && args.PrevLogTerm == rf.logEntries[len(rf.peers) - 1].Term {
 				rf.logEntries = append(rf.logEntries,args.LogEntries...)
 				reply.Success = true
-			} else if args.PrevLogIndex > len(rf.peers) - 1 { // log 匹配失败
+			} else if args.PrevLogIndex > lastLogIndex { // log 匹配失败
 				reply.XLen = len(rf.peers)
 				reply.XTerm = -1
 				reply.XIndex = -1
 				reply.Success = false
-			} else if args.PrevLogIndex <= len(rf.peers) - 1 { // log 匹配失败
+			} else if args.PrevLogIndex <= lastLogIndex { // log 匹配失败
 				reply.XTerm = rf.logEntries[args.PrevLogIndex].Term
 				length := args.PrevLogIndex
 				// 可用二分优化
@@ -291,7 +293,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term == rf.currentTerm {
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 			lastLogIndex, lastLogTerm := rf.getLastLogIndexAndTermNotLock()
-			if lastLogTerm > args.LastLogTerm ||
+			if lastLogTerm < args.LastLogTerm ||
 				(lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
 				isVote = true
 			} else {
@@ -380,13 +382,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index++
 	term := rf.currentTerm
 	isLeader := rf.state == LeaderState
-
-	rf.logEntries = append(rf.logEntries , struct {
-		Term    int
-		Command interface{}
-	}{Term: term, Command: command})
-	rf.matchIndex[rf.me] = index
-
+	if isLeader {
+		rf.logEntries = append(rf.logEntries , struct {
+			Term    int
+			Command interface{}
+		}{Term: term, Command: command})
+		rf.matchIndex[rf.me] = index
+	}
+	DPrintf("index = %d, term = %d, isLeader = %t",index, term, isLeader)
 	return index, term, isLeader
 }
 
@@ -486,64 +489,78 @@ func (rf *Raft) sendHeartBeat() {
 				break
 			}
 			for i := 0; i < len(rf.peers); i++ {
-				go func(index int) {
-					rf.mu.Lock()
-					LastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
-					PrevLogIndex := -1
-					PrevLogTerm := -1
-					var LogEntries []LogEntry
-					if LastLogIndex >= rf.nextIndex[index] {
-						PrevLogIndex = rf.nextIndex[index] - 1
-						PrevLogTerm = rf.logEntries[PrevLogIndex].Term
-						LogEntries = rf.logEntries[rf.nextIndex[index]:]
-					}
-					rf.mu.Unlock()
-					
-					args := &AppendEntriesArgs{
-						Term:         term,
-						LeaderId:     leaderId,
-						PrevLogIndex: PrevLogIndex,
-						PrevLogTerm:  PrevLogTerm,
-						LogEntries:   LogEntries,
-						LeaderCommit: leaderCommit,
-					}
+				if i != leaderId {
+					go func(index int) {
+						rf.mu.Lock()
+						LastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
+						PrevLogIndex := -1
+						PrevLogTerm := -1
+						var LogEntries []LogEntry
+						if LastLogIndex >= rf.nextIndex[index] {
+							PrevLogIndex = rf.nextIndex[index] - 1
+							DPrintf("PrevLogIndex = %d, index = %d, rf.nextIndex[index] = %d, leaderId = %d\n",PrevLogIndex,index,rf.nextIndex[index], leaderId)
+							PrevLogTerm = rf.logEntries[PrevLogIndex].Term
+							LogEntries = rf.logEntries[rf.nextIndex[index]:]
+						}
+						rf.mu.Unlock()
 
-					replay := &AppendEntriesReply{}
-					ok := rf.sendAppendEntries(index, args, replay)
+						args := &AppendEntriesArgs{
+							Term:         term,
+							LeaderId:     leaderId,
+							PrevLogIndex: PrevLogIndex,
+							PrevLogTerm:  PrevLogTerm,
+							LogEntries:   LogEntries,
+							LeaderCommit: leaderCommit,
+						}
 
-					rf.mu.Lock()
-					// 成功或者失败需要有不同的操作
-					if ok && replay.Success == true {
-						// TODO matchIndex
-						rf.matchIndex[index] = LastLogIndex
-						rf.nextIndex[index] = LastLogIndex + 1
-					}
+						replay := &AppendEntriesReply{}
+						ok := rf.sendAppendEntries(index, args, replay)
 
-					if ok && replay.Success == false {
-						if replay.XTerm == -1 {
-							rf.nextIndex[index] = replay.XLen
-						} else {
-							// 可二分优化
-							length := LastLogIndex
-							for length >= 0 && rf.logEntries[length].Term != replay.XTerm {
-								length--
+						rf.mu.Lock()
+
+						if ok && replay.Term > rf.currentTerm {
+							DPrintf("rf.state = %d, rf.currentTerm = %d, replay.Term = %d",rf.state,rf.currentTerm,replay.Term)
+							rf.currentTerm = replay.Term
+							rf.votedFor = -1
+							rf.changeStateNotLock(FollowerState)
+						}
+
+						if ok && replay.Term == rf.currentTerm {
+							// 成功或者失败需要有不同的操作
+							if replay.Success == true {
+								// TODO matchIndex
+								match := args.PrevLogIndex + len(args.LogEntries)
+								if rf.matchIndex[index] < match {
+									rf.matchIndex[index] = match
+								}
+								next := match + 1
+								if rf.nextIndex[index] < next {
+									rf.nextIndex[index] = next
+								}
 							}
-							if length == -1 {
-								rf.nextIndex[index] = replay.XIndex
-							} else {
-								rf.nextIndex[index] = length + 1
+
+							if replay.Success == false {
+								if replay.XTerm == -1 {
+									rf.nextIndex[index] = replay.XLen
+								} else {
+									// 可二分优化
+									length := LastLogIndex
+									for length >= 0 && rf.logEntries[length].Term != replay.XTerm {
+										length--
+									}
+									if length == -1 {
+										rf.nextIndex[index] = replay.XIndex
+									} else {
+										// TODO 调查length 到底用那个值
+										// conflict nextIndex--
+										rf.nextIndex[index] = length
+									}
+								}
 							}
 						}
-					}
-
-					if ok && replay.Term > rf.currentTerm {
-						DPrintf("rf.state = %d, rf.currentTerm = %d, replay.Term = %d",rf.state,rf.currentTerm,replay.Term)
-						rf.currentTerm = replay.Term
-						rf.votedFor = -1
-						rf.changeStateNotLock(FollowerState)
-					}
-					rf.mu.Unlock()
-				}(i)
+						rf.mu.Unlock()
+					}(i)
+				}
 			}
 			time.Sleep(HeartBeatTimeout)
 		}

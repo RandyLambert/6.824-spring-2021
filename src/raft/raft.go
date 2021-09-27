@@ -19,7 +19,10 @@ package raft
 
 import (
 	"crypto/rand"
+	"log"
 	"math/big"
+	"net/http"
+	_ "net/http/pprof"
 	"time"
 
 	//	"bytes"
@@ -180,6 +183,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前任期，对于领导者而言
 	Success bool // 结果为真 如果跟随者所含有的条目和prevLogIndex以及prevLogTerm匹配上了
+	Conflict bool
 
 	XTerm	int // Follower 这个是Follower中与Leader冲突的Log对应的任期号
 	// 在之前（7.1）有介绍Leader会在prevLogTerm中带上本地Log记录中，前一条Log的任期号。
@@ -192,44 +196,98 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 	rf.mu.Lock()
-	if args.Term >= rf.currentTerm {
-		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term
-			rf.votedFor = -1
-			rf.leaderId = args.LeaderId
-			rf.changeStateNotLock(FollowerState)
-		}
+	defer rf.mu.Unlock()
+	reply.Success = false
+	reply.Term = rf.currentTerm
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.leaderId = args.LeaderId
+		rf.changeStateNotLock(FollowerState)
+		return
+	} else if args.Term < rf.currentTerm {
+		return
+	} else if args.Term == rf.currentTerm {
 		rf.heartBeat<-true
 		// TODO 不一样
 		// 有 log
 		if len(args.LogEntries) != 0 {
 			// log 匹配成功
 			lastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
-			if args.PrevLogIndex == lastLogIndex && args.PrevLogTerm == rf.logEntries[len(rf.peers) - 1].Term {
-				rf.logEntries = append(rf.logEntries,args.LogEntries...)
-				reply.Success = true
-			} else if args.PrevLogIndex > lastLogIndex { // log 匹配失败
+			if args.PrevLogIndex > lastLogIndex { // log 匹配失败
 				reply.XLen = len(rf.peers)
 				reply.XTerm = -1
 				reply.XIndex = -1
 				reply.Success = false
-			} else if args.PrevLogIndex <= lastLogIndex { // log 匹配失败
-				reply.XTerm = rf.logEntries[args.PrevLogIndex].Term
-				length := args.PrevLogIndex
-				// 可用二分优化
-				for length >= 0 && reply.XTerm == rf.logEntries[length].Term {
-					length--
+
+				reply.Conflict = true
+			} else if rf.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+				xTerm := rf.logEntries[args.PrevLogIndex].Term
+				for xIndex := args.PrevLogIndex; xIndex > 0; xIndex-- {
+					if rf.logEntries[xIndex - 1].Term != xTerm {
+						reply.XIndex = xIndex
+						break
+					}
 				}
-				reply.XIndex = length + 1
+				reply.XTerm = xTerm
+				reply.XLen = len(rf.logEntries)
 				reply.Success = false
+
+				reply.Conflict = true
+			} else {
+				for index, entry := range args.LogEntries {
+					// append entries rpc 3
+					entryIndex := args.PrevLogIndex + index + 1
+					lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+					if entryIndex <= lastLogIndex && rf.logEntries[entryIndex].Term != entry.Term {
+						// go 切片截断
+						//rf.log.truncate(entry.Index)
+						//rf.persist()
+					}
+
+					// append entries rpc 4
+					lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+					if entryIndex > lastLogIndex {
+						rf.logEntries = append(rf.logEntries, args.LogEntries[index:]...)
+						//rf.persist()
+						break
+					}
+				}
+
+				// append entries rpc 5
+				if args.LeaderCommit > rf.commitIndex {
+					lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+					if args.LeaderCommit < lastLogIndex {
+						rf.commitIndex = args.LeaderCommit
+					} else {
+						rf.commitIndex = lastLogIndex
+					}
+					// TODO remember
+					//rf.apply()
+				}
+				reply.Success = true
 			}
-		} else {
-			reply.Success = true
+
+			//if args.PrevLogIndex == lastLogIndex && args.PrevLogTerm == rf.logEntries[len(rf.peers) - 1].Term {
+			//	rf.logEntries = append(rf.logEntries,args.LogEntries...)
+			//	reply.Success = true
+			//} else if args.PrevLogIndex > lastLogIndex { // log 匹配失败
+			//	reply.XLen = len(rf.peers)
+			//	reply.XTerm = -1
+			//	reply.XIndex = -1
+			//	reply.Success = false
+			//} else if args.PrevLogIndex <= lastLogIndex { // log 匹配失败
+			//	reply.XTerm = rf.logEntries[args.PrevLogIndex].Term
+			//	length := args.PrevLogIndex
+			//	// 可用二分优化
+			//	for length >= 0 && reply.XTerm == rf.logEntries[length].Term {
+			//		length--
+			//	}
+			//	reply.XIndex = length + 1
+			//	reply.Success = false
+			//}
 		}
 	}
-
-	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -376,6 +434,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Lock()
+	if rf.state != LeaderState {
+		return -1, rf.currentTerm, false
+	}
 	// index 是当前最大值
 	index,_ := rf.getLastLogIndexAndTermNotLock()
 	// 下一个index的大小
@@ -475,15 +536,18 @@ func (rf *Raft) initiateElection() {
 
 }
 
+var a int
+var mmu sync.Mutex
 func (rf *Raft) sendHeartBeat() {
 	go func(){
+		DPrintf("go func 540--------------------------------------")
 		rf.mu.Lock()
 		term := rf.currentTerm
 		leaderId := rf.me
 		leaderCommit := rf.commitIndex
 		rf.mu.Unlock()
 
-		for {
+		for !rf.killed() {
 			currentTerm, isLeader := rf.GetState()
 			if currentTerm != term || !isLeader {
 				break
@@ -492,6 +556,10 @@ func (rf *Raft) sendHeartBeat() {
 				if i != leaderId {
 					go func(index int) {
 						rf.mu.Lock()
+						mmu.Lock()
+						DPrintf("go func 554 begin %d, rf.me = %d, rf.statue = %d", a, rf.me, rf.state)
+						a++
+						mmu.Unlock()
 						LastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
 						PrevLogIndex := -1
 						PrevLogTerm := -1
@@ -527,6 +595,7 @@ func (rf *Raft) sendHeartBeat() {
 
 						if ok && replay.Term == rf.currentTerm {
 							// 成功或者失败需要有不同的操作
+							DPrintf("replay.XTerm = %d ,replay.XIndex = %d ,replay.XLen = %d, replay.Success = %t, replay.Conflict = %t",replay.XTerm, replay.XIndex, replay.XLen, replay.Success ,replay.Conflict)
 							if replay.Success == true {
 								// TODO matchIndex
 								match := args.PrevLogIndex + len(args.LogEntries)
@@ -537,9 +606,7 @@ func (rf *Raft) sendHeartBeat() {
 								if rf.nextIndex[index] < next {
 									rf.nextIndex[index] = next
 								}
-							}
-
-							if replay.Success == false {
+							} else if replay.Conflict {
 								if replay.XTerm == -1 {
 									rf.nextIndex[index] = replay.XLen
 								} else {
@@ -556,9 +623,15 @@ func (rf *Raft) sendHeartBeat() {
 										rf.nextIndex[index] = length
 									}
 								}
+							} else if rf.nextIndex[index] > 1 {
+								rf.nextIndex[index]--
 							}
 						}
+						mmu.Lock()
+						a--
+						DPrintf("go func 554 end %d, rf.me = %d, rf.statue = %d",a,rf.me,rf.state)
 						rf.mu.Unlock()
+						mmu.Unlock()
 					}(i)
 				}
 			}
@@ -598,6 +671,9 @@ func (rf *Raft) ticker() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister

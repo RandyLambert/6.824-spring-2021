@@ -19,10 +19,10 @@ package raft
 
 import (
 	"crypto/rand"
-	"log"
 	"math/big"
-	"net/http"
 	_ "net/http/pprof"
+	"os"
+	"runtime"
 	"time"
 
 	//	"bytes"
@@ -69,11 +69,11 @@ const (
 )
 
 const (
-	ElectionTimeout  = time.Millisecond * 300
+	ElectionTimeoutMin  = 150
+	ElectionTimeoutMax  = 300
 	HeartBeatTimeout = time.Millisecond * 100
 	ApplyInterval    = time.Millisecond * 100 // apply log
 	RPCTimeout       = time.Millisecond * 100
-	MaxLockTime      = time.Millisecond * 10 // debug
 )
 
 //
@@ -100,6 +100,7 @@ type Raft struct {
 	matchIndex  []int     // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
 	leaderId    int       // 领导者ID 因此跟随者可以对客户端进行重定向（译者注：跟随者根据领导者id把客户端的请求重定向到领导者，比如有时客户端把请求发给了跟随者而不是领导者）
 	heartBeat   chan bool // 心跳,打断超时时间
+	applyCond   *sync.Cond // 唤醒 apply 干活
 
 }
 
@@ -241,6 +242,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
 					if entryIndex <= lastLogIndex && rf.logEntries[entryIndex].Term != entry.Term {
 						// go 切片截断
+						rf.logEntries = rf.logEntries[:entryIndex + 1]
 						//rf.log.truncate(entry.Index)
 						//rf.persist()
 					}
@@ -249,6 +251,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
 					if entryIndex > lastLogIndex {
 						rf.logEntries = append(rf.logEntries, args.LogEntries[index:]...)
+						lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+						DPrintf("in log append lastLogIndex = %d",lastLogIndex)
 						//rf.persist()
 						break
 					}
@@ -262,8 +266,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					} else {
 						rf.commitIndex = lastLogIndex
 					}
-					// TODO remember
-					//rf.apply()
+					DPrintf("rf.applyCond.Broadcast() rf.me = %d",rf.me)
+					rf.applyCond.Broadcast()
 				}
 				reply.Success = true
 			}
@@ -433,10 +437,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
-	defer rf.mu.Lock()
-	if rf.state != LeaderState {
-		return -1, rf.currentTerm, false
-	}
+	defer rf.mu.Unlock()
 	// index 是当前最大值
 	index,_ := rf.getLastLogIndexAndTermNotLock()
 	// 下一个index的大小
@@ -449,8 +450,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command interface{}
 		}{Term: term, Command: command})
 		rf.matchIndex[rf.me] = index
+		lastLogIndex,_ := rf.getLastLogIndexAndTermNotLock()
+		DPrintf("Start|rf.me = %d is Leader, lastLogIndex = %d",rf.me,lastLogIndex)
 	}
-	DPrintf("index = %d, term = %d, isLeader = %t",index, term, isLeader)
+	//rf.heartBeat <- true
 	return index, term, isLeader
 }
 
@@ -536,15 +539,13 @@ func (rf *Raft) initiateElection() {
 
 }
 
-var a int
-var mmu sync.Mutex
+//var a int
+//var mmu sync.Mutex
 func (rf *Raft) sendHeartBeat() {
 	go func(){
-		DPrintf("go func 540--------------------------------------")
 		rf.mu.Lock()
 		term := rf.currentTerm
 		leaderId := rf.me
-		leaderCommit := rf.commitIndex
 		rf.mu.Unlock()
 
 		for !rf.killed() {
@@ -556,19 +557,20 @@ func (rf *Raft) sendHeartBeat() {
 				if i != leaderId {
 					go func(index int) {
 						rf.mu.Lock()
-						mmu.Lock()
-						DPrintf("go func 554 begin %d, rf.me = %d, rf.statue = %d", a, rf.me, rf.state)
-						a++
-						mmu.Unlock()
+						//mmu.Lock()
+						//DPrintf("go func 554 begin %d, rf.me = %d, rf.statue = %d", a, rf.me, rf.state)
+						//a++
+						//mmu.Unlock()
 						LastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
+						leaderCommit := rf.commitIndex
 						PrevLogIndex := -1
 						PrevLogTerm := -1
 						var LogEntries []LogEntry
 						if LastLogIndex >= rf.nextIndex[index] {
 							PrevLogIndex = rf.nextIndex[index] - 1
-							DPrintf("PrevLogIndex = %d, index = %d, rf.nextIndex[index] = %d, leaderId = %d\n",PrevLogIndex,index,rf.nextIndex[index], leaderId)
 							PrevLogTerm = rf.logEntries[PrevLogIndex].Term
 							LogEntries = rf.logEntries[rf.nextIndex[index]:]
+							DPrintf("PrevLogIndex = %d, raftId = %d, rf.nextIndex[index] = %d, leaderId = %d, rf.logEntries[PrevLogIndex].Term = %d, rf.currentTerm = %d, len(LogEntries) = %d\n",PrevLogIndex,index,rf.nextIndex[index], leaderId, rf.logEntries[PrevLogIndex].Term,rf.currentTerm,len(LogEntries))
 						}
 						rf.mu.Unlock()
 
@@ -595,7 +597,8 @@ func (rf *Raft) sendHeartBeat() {
 
 						if ok && replay.Term == rf.currentTerm {
 							// 成功或者失败需要有不同的操作
-							DPrintf("replay.XTerm = %d ,replay.XIndex = %d ,replay.XLen = %d, replay.Success = %t, replay.Conflict = %t",replay.XTerm, replay.XIndex, replay.XLen, replay.Success ,replay.Conflict)
+							// TODO debug this
+							//DPrintf("replay.XTerm = %d ,replay.XIndex = %d ,replay.XLen = %d, replay.Success = %t, replay.Conflict = %t",replay.XTerm, replay.XIndex, replay.XLen, replay.Success ,replay.Conflict)
 							if replay.Success == true {
 								// TODO matchIndex
 								match := args.PrevLogIndex + len(args.LogEntries)
@@ -606,6 +609,7 @@ func (rf *Raft) sendHeartBeat() {
 								if rf.nextIndex[index] < next {
 									rf.nextIndex[index] = next
 								}
+								DPrintf("rf.nextIndex[index] = %d",rf.nextIndex[index])
 							} else if replay.Conflict {
 								if replay.XTerm == -1 {
 									rf.nextIndex[index] = replay.XLen
@@ -627,11 +631,33 @@ func (rf *Raft) sendHeartBeat() {
 								rf.nextIndex[index]--
 							}
 						}
-						mmu.Lock()
-						a--
-						DPrintf("go func 554 end %d, rf.me = %d, rf.statue = %d",a,rf.me,rf.state)
+
+						LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+						commitIndexOld := rf.commitIndex
+						for commitIndex := rf.commitIndex + 1;commitIndex <= LastLogIndex; commitIndex++ {
+							replayNum := 0
+							for peerIndex := 0;peerIndex < len(rf.peers);peerIndex++ {
+								if rf.nextIndex[peerIndex] > commitIndex {
+									replayNum++
+								}
+								if replayNum == len(rf.peers)/2+1 {
+									rf.commitIndex++
+									break
+								}
+							}
+							if replayNum < len(rf.peers)/2+1 {
+								break
+							}
+						}
+						if rf.commitIndex > commitIndexOld {
+							DPrintf("commitIndex = %d",rf.commitIndex)
+							rf.applyCond.Broadcast()
+						}
+						//mmu.Lock()
+						//a--
+						//DPrintf("go func 554 end %d, rf.me = %d, rf.statue = %d",a,rf.me,rf.state)
 						rf.mu.Unlock()
-						mmu.Unlock()
+						//mmu.Unlock()
 					}(i)
 				}
 			}
@@ -645,8 +671,8 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep()
-		sleepTime,_ := rand.Int(rand.Reader, big.NewInt(150))
-		timeOut := time.After(time.Duration(sleepTime.Int64() + 150) * time.Millisecond)
+		sleepTime,_ := rand.Int(rand.Reader, big.NewInt(ElectionTimeoutMin))
+		timeOut := time.After(time.Duration(sleepTime.Int64() + ElectionTimeoutMax - ElectionTimeoutMin) * time.Millisecond)
 		//DPrintf("%d",sleepTime)
 		select {
 		case <-timeOut:
@@ -655,6 +681,28 @@ func (rf *Raft) ticker() {
 			break
 			//DPrintf("heartBeat")
 		}
+	}
+}
+
+func (rf *Raft) applyTicker() {
+	for rf.killed() == false {
+		DPrintf("in applyTicker rf.commitIndex = %d, rf.lastApplied = %d, rf.me = %d",rf.commitIndex,rf.lastApplied, rf.me)
+		rf.mu.Lock()
+		lastLogIndex,_ := rf.getLastLogIndexAndTermNotLock()
+		if rf.commitIndex > rf.lastApplied && lastLogIndex > rf.lastApplied {
+			rf.lastApplied++
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logEntries[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
+		} else {
+			rf.applyCond.Wait()
+		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -671,9 +719,9 @@ func (rf *Raft) ticker() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
+	//go func() {
+	//	log.Println(http.ListenAndServe("localhost:6060", nil))
+	//}()
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -686,6 +734,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term    int
 		Command interface{}
 	}{Term: 1, Command: nil})
+	rf.applyCond = sync.NewCond(&rf.mu)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -693,7 +742,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.applyTicker()
+	go func() {
+		for !rf.killed() {
+			time.Sleep(1 * time.Second)
+			//DPrintf("%d", runtime.NumGoroutine())
+			if runtime.NumGoroutine() > 2000 {
+				rf.Kill()
+				os.Exit(0)
+			}
+		}
+	}()
 
 	return rf
 }

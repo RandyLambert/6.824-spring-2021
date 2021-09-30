@@ -23,5 +23,19 @@ func TestTicker(t *testing.T) {
 }
 
 func TestHelloWorld(t *testing.T) {
-	t.Log("hello world")
+	var s []string
+	//s := make([]string,5)
+	t.Log(len(s))
+
+	s = append(s,"sdada")
+	s = append(s,"sdada")
+	s = append(s,"sdada")
+	s = append(s,"sdada")
+	s = append(s,"sdada")
+
+	t.Log(len(s))
+
+	s = s[0:3]
+
+	t.Log(len(s))
 }

@@ -118,6 +118,7 @@ func (rf *Raft) changeStateNotLock(state int32) {
 	if state == CandidateState {
 		rf.CurrentTerm++
 		rf.VotedFor = rf.me
+		rf.persist()
 	} else if state == LeaderState {
 		rf.leaderId = rf.me
 
@@ -202,6 +203,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.VotedFor = voteFor
 		rf.LogEntries = logs
 	}
+	DPrintf("readPersist|rf.CurrentTerm = %d, rf.VotedFor = %d, len(rf.LogEntries) = %d",rf.CurrentTerm, rf.VotedFor, len(rf.LogEntries))
 }
 
 
@@ -240,9 +242,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("AppendEntries|rf.me = %d,args.Term = %d,args.LeaderId = %d, receive AppendEntries become Follower",rf.me,args.Term,args.LeaderId)
 		rf.CurrentTerm = args.Term
 		rf.VotedFor = -1
+		rf.persist()
 		rf.leaderId = args.LeaderId
 		rf.changeStateNotLock(FollowerState)
-		rf.persist()
 		rf.heartBeat<-true
 		return
 	}
@@ -320,18 +322,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//		rf.applyCond.Broadcast()
 	//	}
 	//}
-	//// append entries rpc 5
-	////lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
 	//reply.Success = true
 
 
 	if args.Term == rf.CurrentTerm {
-		rf.heartBeat<-true
 		// TODO 不一样
 		// log 匹配成功
 		lastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
-		//DPrintf("appendEntries|args.Term = %d,args.PrevLogTerm = %d,args.PrevLogIndex = %d,args.LogEntries = %v,lastLogIndex = %d,rf.me = %d,rf.LogEntries = %v",args.Term,args.PrevLogTerm,args.PrevLogIndex,args.LogEntries,lastLogIndex,rf.me,rf.LogEntries)
-		DPrintf("appendEntries|args.Term = %d,args.PrevLogTerm = %d,args.PrevLogIndex = %d,len(args.LogEntries) = %d,lastLogIndex = %d,rf.me = %d,len(rf.LogEntries) = %d",args.Term,args.PrevLogTerm,args.PrevLogIndex,len(args.LogEntries),lastLogIndex,rf.me,len(rf.LogEntries))
+		//DPrintf("appendEntries|args.Term = %d,args.LeaderId = %d,args.PrevLogTerm = %d,args.PrevLogIndex = %d,args.LeaderCommit = %d,args.LogEntries = %v,lastLogIndex = %d,rf.me = %d,rf.LogEntries = %v",args.Term,args.LeaderId,args.PrevLogTerm,args.PrevLogIndex,args.LeaderCommit,args.LogEntries,lastLogIndex,rf.me,rf.LogEntries)
+		DPrintf("AppendEntries|args.Term = %d,args.LeaderId = %d,args.PrevLogTerm = %d,args.PrevLogIndex = %d,args.LeaderCommit = %d,len(args.LogEntries) = %d,lastLogIndex = %d,rf.me = %d,len(rf.LogEntries) = %d",args.Term,args.LeaderId,args.PrevLogTerm,args.PrevLogIndex,args.LeaderCommit,len(args.LogEntries),lastLogIndex,rf.me,len(rf.LogEntries))
 		if args.PrevLogIndex > lastLogIndex { // log 匹配失败
 			reply.XLen = len(rf.LogEntries)
 			reply.XTerm = -1
@@ -449,6 +448,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.CurrentTerm < args.Term {
 			rf.CurrentTerm = args.Term
 			rf.VotedFor = -1
+			rf.persist()
 			rf.changeStateNotLock(FollowerState)
 		}
 
@@ -539,8 +539,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term    int
 			Command interface{}
 		}{Term: term, Command: command})
-		rf.matchIndex[rf.me] = index
 		rf.persist()
+		rf.matchIndex[rf.me] = index
 		DPrintf("Start|rf.me = %d is Leader, term = %d, lastLogIndex = %d, command = %v\n", rf.me, rf.CurrentTerm, index, command)
 	}
 	return index, term, isLeader
@@ -587,10 +587,10 @@ func (rf *Raft) initiateElection() {
 	}
 	// 当前的任期值加1,并改变状态为Candidate
 	rf.changeStateNotLock(CandidateState)
-	rf.persist()
 	me := rf.me
 	term := rf.CurrentTerm
 	lastLogIndex,lastLogTerm := rf.getLastLogIndexAndTermNotLock()
+	DPrintf("initiateElection|begin election|rf.me = %d, rf.CurrentTerm = %d, len(rf.LogEntries) = %d",rf.me, rf.CurrentTerm, len(rf.LogEntries))
 	// 给自己投票,记票为1
 	count := 1
 	rf.mu.Unlock()
@@ -613,24 +613,29 @@ func (rf *Raft) initiateElection() {
 					}
 					muCount.Lock()
 					rf.mu.Lock()
+					// TODO update
+					if rf.CurrentTerm != args.Term {
+						rf.mu.Unlock()
+						return
+					}
 					if replay.VoteGranted == false {
-						if rf.CurrentTerm < replay.Term {
-							rf.CurrentTerm = replay.Term
-							rf.VotedFor = -1
-							rf.changeStateNotLock(FollowerState)
-							rf.persist()
-						}
+						// TODO check
+						//if rf.CurrentTerm < replay.Term {
+						//	rf.CurrentTerm = replay.Term
+						//	rf.VotedFor = -1
+						//	rf.persist()
+						//	rf.changeStateNotLock(FollowerState)
+						//}
 					} else {
 						if replay.Term == term {
 							count++
 						}
 						if count == len(rf.peers)/2+1 && rf.CurrentTerm == term && rf.state == CandidateState {
 							// 选举成功
-							rf.heartBeat<-true
 							rf.changeStateNotLock(LeaderState)
 							//DPrintf("initiateElection|rf.me %d become leader, rf.LogEntries = %v, rf.CurrentTerm = %d, rf.commitIndex = %d\n", rf.me,rf.LogEntries,rf.CurrentTerm,rf.commitIndex)
 							DPrintf("initiateElection|rf.me %d become leader, len(rf.LogEntries) = %d, rf.CurrentTerm = %d, rf.commitIndex = %d\n", rf.me,len(rf.LogEntries),rf.CurrentTerm,rf.commitIndex)
-							rf.persist()
+							//rf.persist()
 							rf.sendHeartBeat()
 						}
 					}
@@ -695,15 +700,15 @@ func (rf *Raft) sendHeartBeat() {
 							return
 						}
 						rf.mu.Lock()
-						if rf.state != LeaderState {
+						if rf.state != LeaderState || rf.CurrentTerm != args.Term {
 							rf.mu.Unlock()
 							return
 						}
 						if ok && replay.Term > rf.CurrentTerm {
 							rf.CurrentTerm = replay.Term
 							rf.VotedFor = -1
-							rf.changeStateNotLock(FollowerState)
 							rf.persist()
+							rf.changeStateNotLock(FollowerState)
 						}
 
 						if ok && replay.Term == rf.CurrentTerm {
@@ -744,47 +749,47 @@ func (rf *Raft) sendHeartBeat() {
 							}
 						}
 
-						LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
-						commitIndexOld := rf.commitIndex
-						for commitIndex := rf.commitIndex + 1;commitIndex <= LastLogIndex; commitIndex++ {
-							replayNum := 0
-							for peerIndex := 0;peerIndex < len(rf.peers);peerIndex++ {
-								if rf.matchIndex[peerIndex] >= commitIndex {
-									replayNum++
-								}
-								if replayNum == len(rf.peers)/2+1 {
-									rf.commitIndex++
-									break
-								}
-							}
-							if replayNum < len(rf.peers)/2+1 {
-								break
-							}
-						}
-						if rf.commitIndex > commitIndexOld {
-							DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d",rf.commitIndex,rf.me)
-							rf.applyCond.Broadcast()
-						}
-
-						// TODO old version
 						//LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
-						//for n := rf.commitIndex + 1; n <= LastLogIndex; n++ {
-						//	if rf.LogEntries[n].Term != rf.CurrentTerm {
-						//		continue
-						//	}
-						//	counter := 1
-						//	for serverId := 0; serverId < len(rf.peers); serverId++ {
-						//		if serverId != rf.me && rf.matchIndex[serverId] >= n {
-						//			counter++
+						//commitIndexOld := rf.commitIndex
+						//for commitIndex := rf.commitIndex + 1;commitIndex <= LastLogIndex; commitIndex++ {
+						//	replayNum := 0
+						//	for peerIndex := 0;peerIndex < len(rf.peers);peerIndex++ {
+						//		if rf.matchIndex[peerIndex] >= commitIndex {
+						//			replayNum++
 						//		}
-						//		if counter > len(rf.peers)/2 {
-						//			DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d",n,rf.me)
-						//			rf.commitIndex = n
-						//			rf.applyCond.Broadcast()
+						//		if replayNum == len(rf.peers)/2+1 {
+						//			rf.commitIndex++
 						//			break
 						//		}
 						//	}
+						//	if replayNum < len(rf.peers)/2+1 {
+						//		break
+						//	}
 						//}
+						//if rf.commitIndex > commitIndexOld {
+						//	DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d",rf.commitIndex,rf.me)
+						//	rf.applyCond.Broadcast()
+						//}
+
+						// TODO old version
+						LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+						for n := rf.commitIndex + 1; n <= LastLogIndex; n++ {
+							if rf.LogEntries[n].Term != rf.CurrentTerm {
+								continue
+							}
+							counter := 1
+							for serverId := 0; serverId < len(rf.peers); serverId++ {
+								if serverId != rf.me && rf.matchIndex[serverId] >= n {
+									counter++
+								}
+								if counter > len(rf.peers)/2 {
+									DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d",n,rf.me)
+									rf.commitIndex = n
+									rf.applyCond.Broadcast()
+									break
+								}
+							}
+						}
 						rf.mu.Unlock()
 					}(i)
 				}

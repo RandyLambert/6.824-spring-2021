@@ -8,7 +8,9 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
@@ -1035,7 +1037,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			cfg.crash1(victim)
 			cfg.one(rand.Int(), servers-1, true)
 		}
-		// send enough to get a snapshot
+		// send enough to get a SnapshotData
 		for i := 0; i < SnapShotInterval+1; i++ {
 			cfg.rafts[sender].Start(rand.Int())
 		}
@@ -1047,7 +1049,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		}
 		if disconnect {
 			// reconnect a follower, who maybe behind and
-			// needs to rceive a snapshot to catch up.
+			// needs to rceive a SnapshotData to catch up.
 			cfg.connect(victim)
 			cfg.one(rand.Int(), servers, true)
 			leader1 = cfg.checkOneLeader()
@@ -1082,3 +1084,4 @@ func TestSnapshotInstallCrash2D(t *testing.T) {
 func TestSnapshotInstallUnCrash2D(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (unreliable+crash)", false, false, true)
 }
+// Previous

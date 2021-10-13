@@ -92,16 +92,18 @@ type Raft struct {
 	state       int32      // raft状态
 	CurrentTerm int        // 服务器已知最新的任期（在服务器首次启动的时候初始化为0，单调递增）
 	VotedFor    int        // 当前任期内收到选票的候选者id 如果没有投给任何候选者 则为空
-	LogEntries  []LogEntry // 日志条目;每个条目包含了用于状态机的命令，以及领导者接收到该条目时的任期（第一个索引为1）
-	applyCh     chan ApplyMsg
-	commitIndex int       // 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
-	lastApplied int       // 已经被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
-	nextIndex   []int     // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导者最后的日志条目的索引+1）
-	matchIndex  []int     // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
-	leaderId    int       // 领导者ID 因此跟随者可以对客户端进行重定向（译者注：跟随者根据领导者id把客户端的请求重定向到领导者，比如有时客户端把请求发给了跟随者而不是领导者）
-	heartBeat   chan bool // 心跳,打断超时时间
-	applyCond   *sync.Cond // 唤醒 apply 干活
-
+	LogEntries        []LogEntry // 日志条目;每个条目包含了用于状态机的命令，以及领导者接收到该条目时的任期（第一个索引为1）
+	applyCh           chan ApplyMsg
+	commitIndex       int        // 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
+	lastApplied       int        // 已经被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
+	nextIndex         []int      // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导者最后的日志条目的索引+1）
+	matchIndex        []int      // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
+	leaderId          int        // 领导者ID 因此跟随者可以对客户端进行重定向（译者注：跟随者根据领导者id把客户端的请求重定向到领导者，比如有时客户端把请求发给了跟随者而不是领导者）
+	heartBeat         chan bool  // 心跳,打断超时时间
+	applyCond         *sync.Cond // 唤醒 apply 干活
+	snapShotCond      *sync.Cond // 唤醒干活快照
+	LastIncludedIndex int        // 日志快照保存的位置
+	LastIncludedTerm  int
 }
 
 // return CurrentTerm and whether this server
@@ -132,12 +134,7 @@ func (rf *Raft) changeStateNotLock(state int32) {
 	}
 }
 
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
+func (rf *Raft)persistData() []byte {
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -151,19 +148,41 @@ func (rf *Raft) persist() {
 	err := e.Encode(rf.CurrentTerm)
 	if err != nil {
 		log.Fatalf("persist|rf.CurrentTerm = %d error",rf.CurrentTerm)
-		return
+		return nil
 	}
 	err = e.Encode(rf.VotedFor)
 	if err != nil {
 		log.Fatalf("persist|rf.VotedFor = %d error",rf.VotedFor)
-		return
+		return nil
 	}
 	err = e.Encode(rf.LogEntries)
 	if err != nil {
 		log.Fatalf("persist|rf.LogEntries = %v error",rf.LogEntries)
-		return
+		return nil
+	}
+
+	err = e.Encode(rf.LastIncludedIndex)
+	if err != nil {
+		log.Fatalf("persist|rf.LogEntries = %v error",rf.LastIncludedIndex)
+		return nil
+	}
+
+	err = e.Encode(rf.LastIncludedTerm)
+	if err != nil {
+		log.Fatalf("persist|rf.LogEntries = %v error",rf.LastIncludedTerm)
+		return nil
 	}
 	data := w.Bytes()
+	return data
+}
+
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
+func (rf *Raft) persist() {
+	data := rf.persistData()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -194,14 +213,22 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var voteFor int
 	var logs []LogEntry
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&voteFor) != nil ||
-		d.Decode(&logs) != nil {
+		d.Decode(&logs) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 		log.Fatal("readPersist| decode error!\n")
 	} else {
 		rf.CurrentTerm = currentTerm
 		rf.VotedFor = voteFor
 		rf.LogEntries = logs
+		rf.LastIncludedIndex = lastIncludedIndex
+		rf.LastIncludedTerm = lastIncludedTerm
+
 	}
 	DPrintf("readPersist|rf.CurrentTerm = %d, rf.VotedFor = %d, len(rf.LogEntries) = %d",rf.CurrentTerm, rf.VotedFor, len(rf.LogEntries))
 }
@@ -230,6 +257,18 @@ type AppendEntriesReply struct {
 	// 如果Follower在对应位置没有Log，那么这里会返回 -1。
 	XIndex	int // 这个是Follower中，对应任期号为XTerm的第一条Log条目的槽位号。
 	XLen	int // 如果Follower在对应位置没有Log，那么XTerm会返回-1，XLen表示空白的Log槽位数。
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	SnapshotData      []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -330,24 +369,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// log 匹配成功
 		lastLogIndex, _ := rf.getLastLogIndexAndTermNotLock()
 		//DPrintf("appendEntries|args.Term = %d,args.LeaderId = %d,args.PrevLogTerm = %d,args.PrevLogIndex = %d,args.LeaderCommit = %d,args.LogEntries = %v,lastLogIndex = %d,rf.me = %d,rf.LogEntries = %v",args.Term,args.LeaderId,args.PrevLogTerm,args.PrevLogIndex,args.LeaderCommit,args.LogEntries,lastLogIndex,rf.me,rf.LogEntries)
-		DPrintf("AppendEntries|args.Term = %d,args.LeaderId = %d,args.PrevLogTerm = %d,args.PrevLogIndex = %d,args.LeaderCommit = %d,len(args.LogEntries) = %d,lastLogIndex = %d,rf.me = %d,len(rf.LogEntries) = %d",args.Term,args.LeaderId,args.PrevLogTerm,args.PrevLogIndex,args.LeaderCommit,len(args.LogEntries),lastLogIndex,rf.me,len(rf.LogEntries))
+		DPrintf("AppendEntries|args.Term = %d,args.LeaderId = %d,args.PrevLogTerm = %d,args.PrevLogIndex = %d,args.LeaderCommit = %d,len(args.LogEntries) = %d,lastLogIndex = %d,rf.me = %d,rf.LastIncludedIndex = %d,rf.LastIncludedTerm = %d,len(rf.LogEntries) = %d",args.Term,args.LeaderId,args.PrevLogTerm,args.PrevLogIndex,args.LeaderCommit,len(args.LogEntries),lastLogIndex,rf.me,rf.LastIncludedIndex,rf.LastIncludedTerm,len(rf.LogEntries))
 		if args.PrevLogIndex > lastLogIndex { // log 匹配失败
-			reply.XLen = len(rf.LogEntries)
+			reply.XLen = lastLogIndex + 1
+			//reply.XLen = len(rf.LogEntries)
 			reply.XTerm = -1
 			reply.XIndex = -1
 			reply.Success = false
 
 			reply.Conflict = true
-		} else if rf.LogEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
-			xTerm := rf.LogEntries[args.PrevLogIndex].Term
+		} else if rf.LogEntries[args.PrevLogIndex - rf.LastIncludedIndex].Term != args.PrevLogTerm {
+			xTerm := rf.LogEntries[args.PrevLogIndex - rf.LastIncludedIndex].Term
 			for xIndex := args.PrevLogIndex; xIndex > 0; xIndex-- {
-				if rf.LogEntries[xIndex - 1].Term != xTerm {
+				if rf.LogEntries[xIndex - rf.LastIncludedIndex - 1].Term != xTerm {
 					reply.XIndex = xIndex
 					break
 				}
 			}
 			reply.XTerm = xTerm
-			reply.XLen = len(rf.LogEntries)
+			reply.XLen = lastLogIndex + 1
+			//reply.XLen = len(rf.LogEntries)
 			reply.Success = false
 
 			reply.Conflict = true
@@ -356,11 +397,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// append entries rpc 3
 				entryIndex := args.PrevLogIndex + index + 1
 				lastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
-				if entryIndex <= lastLogIndex && rf.LogEntries[entryIndex].Term != entry.Term {
+				if entryIndex <= lastLogIndex && rf.LogEntries[entryIndex - rf.LastIncludedIndex].Term != entry.Term {
 					// go 切片截断
 					//entries := make([]LogEntry, entryIndex )
 					//copy(entries, rf.LogEntries[0:entryIndex])
-					rf.LogEntries = rf.LogEntries[0:entryIndex]
+					rf.LogEntries = rf.LogEntries[0:entryIndex - rf.LastIncludedIndex]
 					rf.persist()
 				}
 
@@ -386,6 +427,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			reply.Success = true
 		}
+		DPrintf("reply.Term = %d,reply.XTerm = %d,reply.XLen = %d,reply.Success = %t,reply.Conflict = %t,reply.XIndex = %d",reply.Term,reply.XTerm,reply.XLen,reply.Success,reply.Conflict,reply.XIndex)
 	}
 }
 
@@ -394,23 +436,113 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	DPrintf("InstallSnapshot|in InstallSnapshot args.LeaderId = %d,args.Term = %d,rf.me = %d",args.LeaderId,args.Term,rf.me)
+
+	rf.mu.Lock()
+	if args.Term < rf.CurrentTerm {
+		reply.Term = rf.CurrentTerm
+		rf.mu.Unlock()
+		return
+	}
+	if args.Term > rf.CurrentTerm {
+		rf.CurrentTerm = args.Term
+		//rf.persist()
+	}
+	reply.Term = rf.CurrentTerm
+
+	DPrintf("InstallSnapshot|has heartBeat args.LeaderId = %d,args.Term = %d,rf.me = %d",args.LeaderId,args.Term,rf.me)
+	rf.heartBeat <- true
+
+	if rf.state != FollowerState {
+		rf.changeStateNotLock(FollowerState)
+	}
+
+	if rf.LastIncludedIndex >= args.LastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+	//如果现存的日志条目与快照中最后包含的日志条目具有相同的索引值和任期号，则保留其后的日志条目并进行回复
+
+	apply := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.SnapshotData,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+	rf.mu.Unlock()
+	rf.applyCh <- apply
+	//rf.CondInstallSnapshot(rf.LastIncludedTerm,rf.LastIncludedIndex,args.SnapshotData)
+}
+
 //
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
+// A service wants to switch to SnapshotData.  Only do so if Raft hasn't
+// have more recent info since it communicate the SnapshotData on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//丢弃整个日志
+	rf.LastIncludedIndex = lastIncludedIndex
+	rf.LastIncludedTerm = lastIncludedTerm
+
+	rf.LogEntries = rf.LogEntries[0:1]
+	rf.LogEntries[0].Term = lastIncludedTerm
+
+	//logEntries := make([]LogEntry,0)
+	//logEntries = append(logEntries,LogEntry{
+	//	Term:    0,
+	//	Command: nil,
+	//})
+	//logEntries = append(logEntries,rf.LogEntries[args.LastIncludedIndex+1:]...)
+	//rf.LogEntries = logEntries
+
+	//保存快照文件，丢弃具有较小索引的任何现有或部分快照
+	rf.persister.SaveStateAndSnapshot(rf.persistData(),snapshot)
+	//rf.mu.Unlock()
+	//rf.mu.Lock()
+	rf.lastApplied = lastIncludedIndex
+	rf.commitIndex = lastIncludedIndex
 
 	return true
 }
 
-// the service says it has created a snapshot that has
+// the service says it has created a SnapshotData that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	DPrintf("make a Snapshot index = %d, rf.commitIndex = %d, rf.LastIncludedIndex = %d, rf.me = %d",index,rf.commitIndex,rf.LastIncludedIndex,rf.me)
+
+	rf.mu.Lock()
+	if index > rf.commitIndex || index <= rf.LastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+
+	lastIncludedTerm := rf.LogEntries[index-rf.LastIncludedIndex].Term
+
+	var logEntries []LogEntry
+	logEntries = append(logEntries, LogEntry{
+		Term:    lastIncludedTerm,
+		Command: nil,
+	})
+	logEntries = append(logEntries, rf.LogEntries[index-rf.LastIncludedIndex+1:]...)
+	rf.LogEntries = logEntries
+	rf.LastIncludedIndex = index
+	rf.LastIncludedTerm = lastIncludedTerm
+	rf.persister.SaveStateAndSnapshot(rf.persistData(), snapshot)
+
+	//rf.CondInstallSnapshot(rf.LastIncludedIndex, rf.LastIncludedTerm,snapshot)
+	rf.mu.Unlock()
 
 }
 
@@ -541,7 +673,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}{Term: term, Command: command})
 		rf.persist()
 		rf.matchIndex[rf.me] = index
-		DPrintf("Start|rf.me = %d is Leader, term = %d, lastLogIndex = %d, command = %v\n", rf.me, rf.CurrentTerm, index, command)
+		DPrintf("Start|rf.me = %d is Leader, Term = %d, lastLogIndex = %d, command = %v\n", rf.me, rf.CurrentTerm, index, command)
 	}
 	return index, term, isLeader
 }
@@ -568,8 +700,8 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) getLastLogIndexAndTermNotLock() (int, int){
-	lastLogIndex := len(rf.LogEntries) - 1
-	lastLogTerm := rf.LogEntries[lastLogIndex].Term
+	lastLogIndex := rf.LastIncludedIndex + len(rf.LogEntries) - 1
+	lastLogTerm := rf.LogEntries[len(rf.LogEntries) - 1].Term
 
 	return lastLogIndex, lastLogTerm
 }
@@ -675,122 +807,177 @@ func (rf *Raft) sendHeartBeat() {
 						PrevLogIndex := LastLogIndex
 						PrevLogTerm := LastLogTerm
 						var LogEntries []LogEntry
+
+						isSnapshot := false
+						var snapshotData []byte
+						var lastIncludedIndex int
+						var lastIncludedTerm int
+
 						if LastLogIndex >= rf.nextIndex[index] {
-							PrevLogIndex = rf.nextIndex[index] - 1
-							PrevLogTerm = rf.LogEntries[PrevLogIndex].Term
-							LogEntries = make([]LogEntry, LastLogIndex - rf.nextIndex[index] + 1)
-							copy(LogEntries,rf.LogEntries[rf.nextIndex[index]:LastLogIndex+1])
-							//DPrintf("sendHeartBeat|PrevLogIndex = %d, index = %d, rf.nextIndex[index] = %d, leaderId = %d, rf.LogEntries[PrevLogIndex].Term = %d, rf.CurrentTerm = %d, len(LogEntries) = %d, LogEntries = %v\n",PrevLogIndex,index,rf.nextIndex[index], leaderId, rf.LogEntries[PrevLogIndex].Term,rf.CurrentTerm,len(LogEntries),LogEntries)
-							DPrintf("sendHeartBeat|PrevLogIndex = %d, index = %d, rf.nextIndex[index] = %d, leaderId = %d, rf.LogEntries[PrevLogIndex].Term = %d, rf.CurrentTerm = %d, len(LogEntries) = %d\n",PrevLogIndex,index,rf.nextIndex[index], leaderId, rf.LogEntries[PrevLogIndex].Term,rf.CurrentTerm,len(LogEntries))
+							DPrintf("sendHeartBeat|append snapshot rf.nextIndex[index] = %d, rf.LastIncludedIndex = %d",rf.nextIndex[index], rf.LastIncludedIndex)
+							if rf.nextIndex[index] <= rf.LastIncludedIndex {
+								isSnapshot = true
+								snapshotData = rf.persister.ReadSnapshot()
+								lastIncludedIndex = rf.LastIncludedIndex
+								lastIncludedTerm = rf.LastIncludedTerm
+							} else {
+								PrevLogIndex = rf.nextIndex[index] - 1
+								PrevLogTerm = rf.LogEntries[PrevLogIndex - rf.LastIncludedIndex].Term
+								LogEntries = make([]LogEntry, LastLogIndex - rf.nextIndex[index] + 1)
+								//copy(LogEntries,rf.LogEntries[rf.nextIndex[index]:LastLogIndex+1])
+								copy(LogEntries,rf.LogEntries[rf.nextIndex[index] - rf.LastIncludedIndex:])
+								//DPrintf("sendHeartBeat|PrevLogIndex = %d, index = %d, rf.nextIndex[index] = %d, LeaderId = %d, rf.LogEntries[PrevLogIndex].Term = %d, rf.CurrentTerm = %d, len(LogEntries) = %d, LogEntries = %v\n",PrevLogIndex,index,rf.nextIndex[index], LeaderId, rf.LogEntries[PrevLogIndex].Term,rf.CurrentTerm,len(LogEntries),LogEntries)
+								//todo
+								//DPrintf("sendHeartBeat|append log PrevLogIndex = %d, index = %d, rf.nextIndex[index] = %d, LeaderId = %d, rf.LogEntries[PrevLogIndex].Term = %d, rf.CurrentTerm = %d, len(LogEntries) = %d\n",PrevLogIndex,index,rf.nextIndex[index], LeaderId, rf.LogEntries[PrevLogIndex].Term,rf.CurrentTerm,len(LogEntries))
+
+							}
 						}
 						rf.mu.Unlock()
 
-						args := &AppendEntriesArgs{
-							Term:         term,
-							LeaderId:     leaderId,
-							PrevLogIndex: PrevLogIndex,
-							PrevLogTerm:  PrevLogTerm,
-							LogEntries:   LogEntries,
-							LeaderCommit: leaderCommit,
-						}
+						if isSnapshot == false {
+							args := &AppendEntriesArgs{
+								Term:         term,
+								LeaderId:     leaderId,
+								PrevLogIndex: PrevLogIndex,
+								PrevLogTerm:  PrevLogTerm,
+								LogEntries:   LogEntries,
+								LeaderCommit: leaderCommit,
+							}
 
-						replay := &AppendEntriesReply{}
-						ok := rf.sendAppendEntries(index, args, replay)
-						if !ok {
-							return
-						}
-						rf.mu.Lock()
-						if rf.state != LeaderState || rf.CurrentTerm != args.Term {
-							rf.mu.Unlock()
-							return
-						}
-						if ok && replay.Term > rf.CurrentTerm {
-							rf.CurrentTerm = replay.Term
-							rf.VotedFor = -1
-							rf.persist()
-							rf.changeStateNotLock(FollowerState)
-						}
+							replay := &AppendEntriesReply{}
+							ok := rf.sendAppendEntries(index, args, replay)
+							if !ok {
+								return
+							}
+							rf.mu.Lock()
+							if rf.state != LeaderState || rf.CurrentTerm != args.Term {
+								rf.mu.Unlock()
+								return
+							}
+							if replay.Term > rf.CurrentTerm {
+								rf.CurrentTerm = replay.Term
+								rf.VotedFor = -1
+								rf.persist()
+								rf.changeStateNotLock(FollowerState)
+							}
 
-						if ok && replay.Term == rf.CurrentTerm {
-						// 成功或者失败需要有不同的操作
-							if replay.Success == true {
-								match := args.PrevLogIndex + len(args.LogEntries)
-								if rf.matchIndex[index] < match {
-									rf.matchIndex[index] = match
-								}
-								next := match + 1
-								if rf.nextIndex[index] < next {
-									rf.nextIndex[index] = next
-								}
-								//rf.persist()
-							} else if replay.Conflict {
-								//if rf.nextIndex[index] > 1{
-								//	rf.nextIndex[index]--
-								//}
-								DPrintf("sendHeartBeat|replay.XLen = %d ,replay.XTerm = %d ,replay.XIndex = %d,replay.Term = %d,replay.Conflict = %t,replay.Success = %t", replay.XLen, replay.XTerm, replay.XIndex, replay.Term, replay.Conflict, replay.Success)
-								if replay.XTerm == -1 {
-									rf.nextIndex[index] = replay.XLen
-								} else {
-									// 可二分优化
-									length := LastLogIndex
-									for length >= 0 && rf.LogEntries[length].Term != replay.XTerm {
-										length--
+							if replay.Term == rf.CurrentTerm {
+								// 成功或者失败需要有不同的操作
+								if replay.Success == true {
+									match := args.PrevLogIndex + len(args.LogEntries)
+									if rf.matchIndex[index] < match {
+										rf.matchIndex[index] = match
 									}
-									if length == -1 {
-										rf.nextIndex[index] = replay.XIndex
+									next := match + 1
+									if rf.nextIndex[index] < next {
+										rf.nextIndex[index] = next
+									}
+									DPrintf("rf.matchIndex[index] = %d,rf.nextIndex[index] = %d",rf.matchIndex[index],rf.nextIndex[index])
+									//rf.persist()
+								} else if replay.Conflict {
+									//if rf.nextIndex[index] > 1{
+									//	rf.nextIndex[index]--
+									//}
+									DPrintf("sendHeartBeat|replay.XLen = %d ,replay.XTerm = %d ,replay.XIndex = %d,replay.Term = %d,replay.Conflict = %t,replay.Success = %t", replay.XLen, replay.XTerm, replay.XIndex, replay.Term, replay.Conflict, replay.Success)
+									if replay.XTerm == -1 {
+										rf.nextIndex[index] = replay.XLen
 									} else {
-										// TODO 调查length 到底用那个值
-										// conflict nextIndex--
-										rf.nextIndex[index] = length
+										// 可二分优化
+										length := LastLogIndex - rf.LastIncludedIndex
+										for length >= 0 && rf.LogEntries[length].Term != replay.XTerm {
+											length--
+										}
+										if length == -1 {
+											rf.nextIndex[index] = replay.XIndex
+										} else {
+											// TODO 调查length 到底用那个值
+											// conflict nextIndex--
+											rf.nextIndex[index] = length
+										}
+									}
+								} else if rf.nextIndex[index] > 1 {
+									rf.nextIndex[index]--
+								}
+							}
+
+							//LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+							//commitIndexOld := rf.commitIndex
+							//for commitIndex := rf.commitIndex + 1;commitIndex <= LastLogIndex; commitIndex++ {
+							//	replayNum := 0
+							//	for peerIndex := 0;peerIndex < len(rf.peers);peerIndex++ {
+							//		if rf.matchIndex[peerIndex] >= commitIndex {
+							//			replayNum++
+							//		}
+							//		if replayNum == len(rf.peers)/2+1 {
+							//			rf.commitIndex++
+							//			break
+							//		}
+							//	}
+							//	if replayNum < len(rf.peers)/2+1 {
+							//		break
+							//	}
+							//}
+							//if rf.commitIndex > commitIndexOld {
+							//	DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d",rf.commitIndex,rf.me)
+							//	rf.applyCond.Broadcast()
+							//}
+
+							// TODO old version
+							LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
+							DPrintf("sendHeartBeat|before in leader LastLogIndex = %d,rf.commitIndex = %d,rf.LastIncludedIndex = %d,len(rf.LogEntries) = %d",LastLogIndex,rf.commitIndex,rf.LastIncludedIndex,len(rf.LogEntries))
+							for n := rf.commitIndex + 1 - rf.LastIncludedIndex; n <= LastLogIndex - rf.LastIncludedIndex; n++ {
+								if rf.LogEntries[n].Term != rf.CurrentTerm {
+									DPrintf("rf.LogEntries[n].Term = %d, rf.CurrentTerm = %d",rf.LogEntries[n].Term, rf.CurrentTerm)
+									continue
+								}
+								counter := 1
+								for serverId := 0; serverId < len(rf.peers); serverId++ {
+									if serverId != rf.me && rf.matchIndex[serverId] >= n {
+										counter++
+									}
+									if counter > len(rf.peers)/2 {
+										DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d, rf.LastIncludedIndex = %d, len(rf.LogEntries) = %d",n,rf.me,rf.LastIncludedIndex,len(rf.LogEntries))
+										rf.commitIndex = n + rf.LastIncludedIndex
+										rf.applyCond.Broadcast()
+										break
 									}
 								}
-							} else if rf.nextIndex[index] > 1 {
-								rf.nextIndex[index]--
 							}
-						}
+							rf.mu.Unlock()
+						} else {
+							args := &InstallSnapshotArgs{
+								Term:              term,
+								LeaderId:          leaderId,
+								LastIncludedIndex: lastIncludedIndex,
+								LastIncludedTerm:  lastIncludedTerm,
+								SnapshotData:      snapshotData,
+							}
 
-						//LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
-						//commitIndexOld := rf.commitIndex
-						//for commitIndex := rf.commitIndex + 1;commitIndex <= LastLogIndex; commitIndex++ {
-						//	replayNum := 0
-						//	for peerIndex := 0;peerIndex < len(rf.peers);peerIndex++ {
-						//		if rf.matchIndex[peerIndex] >= commitIndex {
-						//			replayNum++
-						//		}
-						//		if replayNum == len(rf.peers)/2+1 {
-						//			rf.commitIndex++
-						//			break
-						//		}
-						//	}
-						//	if replayNum < len(rf.peers)/2+1 {
-						//		break
-						//	}
-						//}
-						//if rf.commitIndex > commitIndexOld {
-						//	DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d",rf.commitIndex,rf.me)
-						//	rf.applyCond.Broadcast()
-						//}
+							replay := &InstallSnapshotReply{}
 
-						// TODO old version
-						LastLogIndex, _ = rf.getLastLogIndexAndTermNotLock()
-						for n := rf.commitIndex + 1; n <= LastLogIndex; n++ {
-							if rf.LogEntries[n].Term != rf.CurrentTerm {
-								continue
+							ok := rf.sendInstallSnapshot(index ,args, replay)
+							if !ok {
+								return
 							}
-							counter := 1
-							for serverId := 0; serverId < len(rf.peers); serverId++ {
-								if serverId != rf.me && rf.matchIndex[serverId] >= n {
-									counter++
-								}
-								if counter > len(rf.peers)/2 {
-									DPrintf("sendHeartBeat|rf.applyCond.Broadcast() in leader commitIndex = %d, rf.me = %d",n,rf.me)
-									rf.commitIndex = n
-									rf.applyCond.Broadcast()
-									break
-								}
+
+ 							rf.mu.Lock()
+							if rf.state != LeaderState || rf.CurrentTerm != args.Term {
+								rf.mu.Unlock()
+								return
 							}
+
+							if replay.Term > rf.CurrentTerm {
+								rf.CurrentTerm = replay.Term
+								rf.VotedFor = -1
+								rf.persist()
+								rf.changeStateNotLock(FollowerState)
+							}
+
+							rf.nextIndex[index] = lastIncludedIndex + 1
+							rf.matchIndex[index] = lastIncludedIndex
+							DPrintf("sendHeartBeat|sendInstallSnapshot|rf.nextIndex[index] = %d, rf.matchIndex[index] = %d",rf.nextIndex[index], rf.matchIndex[index])
+							rf.mu.Unlock()
 						}
-						rf.mu.Unlock()
 					}(i)
 				}
 			}
@@ -823,7 +1010,7 @@ func (rf *Raft) applyTicker() {
 			rf.lastApplied++
 			applyMsg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.LogEntries[rf.lastApplied].Command,
+				Command:      rf.LogEntries[rf.lastApplied - rf.LastIncludedIndex].Command,
 				CommandIndex: rf.lastApplied,
 			}
 			rf.mu.Unlock()
@@ -861,14 +1048,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FollowerState
 	rf.VotedFor = -1
 	rf.heartBeat = make(chan bool, 1)
+	rf.LastIncludedIndex = 0
+	rf.LastIncludedTerm = 0
 	rf.LogEntries = append(rf.LogEntries, struct {
 		Term    int
 		Command interface{}
 	}{Term: 1, Command: nil})
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.snapShotCond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	if rf.LastIncludedIndex > 0 {
+		rf.lastApplied = rf.LastIncludedIndex
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

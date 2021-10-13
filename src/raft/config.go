@@ -179,7 +179,7 @@ func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 
 const SnapShotInterval = 10
 
-// periodically snapshot raft state
+// periodically SnapshotData raft state
 func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 	lastApplied := 0
 	for m := range applyCh {
@@ -505,7 +505,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	for time.Since(t0).Seconds() < 10 {
 		// try all the servers, maybe one is the leader.
 		index := -1
-		term := 1
+		Term := 1
 		for si := 0; si < cfg.n; si++ {
 			starts = (starts + 1) % cfg.n
 			var rf *Raft
@@ -515,10 +515,11 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			cfg.mu.Unlock()
 			if rf != nil {
+				index1, _, ok := rf.Start(cmd)
 				index1, term1, ok := rf.Start(cmd)
 				if ok {
 					index = index1
-					term = term1
+					Term = term1
 					break
 				}
 			}
@@ -530,7 +531,8 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
-				DPrintf("nd = %d,cmd = %d, cmd1 = %d, index = %d, term = %d, expectedServers = %d",nd, cmd, cmd1, index, term, expectedServers)
+				DPrintf("nd = %d,cmd = %d, cmd1 = %d, index = %d, Term = %d, expectedServers = %d",nd, cmd, cmd1, index, Term, expectedServers)
+				//log.Printf("nd = %d,cmd = %d, cmd1 = %d, index = %d, Term = %d, expectedServers = %d",nd, cmd, cmd1, index, Term, expectedServers)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {

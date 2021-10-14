@@ -380,15 +380,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Conflict = true
 		} else if rf.LogEntries[args.PrevLogIndex - rf.LastIncludedIndex].Term != args.PrevLogTerm {
 			xTerm := rf.LogEntries[args.PrevLogIndex - rf.LastIncludedIndex].Term
-			for xIndex := args.PrevLogIndex; xIndex > 0; xIndex-- {
+			xIndex := 0
+			for xIndex = args.PrevLogIndex; xIndex - rf.LastIncludedIndex > 0; xIndex-- {
 				if rf.LogEntries[xIndex - rf.LastIncludedIndex - 1].Term != xTerm {
 					reply.XIndex = xIndex
 					break
 				}
 			}
+			if xIndex - rf.LastIncludedIndex == 0 {
+				reply.XIndex = rf.LastIncludedIndex
+			}
+
 			reply.XTerm = xTerm
-			reply.XLen = lastLogIndex + 1
-			//reply.XLen = len(rf.LogEntries)
+			//reply.XLen = lastLogIndex + 1
 			reply.Success = false
 
 			reply.Conflict = true

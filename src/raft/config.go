@@ -515,7 +515,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			cfg.mu.Unlock()
 			if rf != nil {
-				index1, _, ok := rf.Start(cmd)
+				//index1, _, ok := rf.Start(cmd)
 				index1, term1, ok := rf.Start(cmd)
 				if ok {
 					index = index1
